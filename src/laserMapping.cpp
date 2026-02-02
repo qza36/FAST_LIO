@@ -951,6 +951,8 @@ public:
         if (odom_interface_en_) {
             tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
             tf_listener_ = std::make_unique<tf2_ros::TransformListener>(*tf_buffer_);
+            pubRegisteredScan_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/registered_scan", 20);
+            pubLidarOdometry_ = this->create_publisher<nav_msgs::msg::Odometry>("/lidar_odometry", 20);
             RCLCPP_INFO(this->get_logger(), "Odom interface enabled: odom_frame=%s, base_frame=%s, lidar_frame=%s",
                         odom_frame_.c_str(), base_frame_.c_str(), lidar_frame_.c_str());
         }
@@ -1082,6 +1084,7 @@ private:
 
             /******* Publish odometry *******/
             publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
+            publish_odom_interface(get_ros_time(lidar_end_time));
 
             /*** add the feature points to map kdtree ***/
             t3 = omp_get_wtime();
@@ -1127,6 +1130,62 @@ private:
         }
     }
 
+    void publish_odom_interface(const rclcpp::Time & stamp)
+    {
+        if (!odom_interface_en_) return;
+
+        if (!tf_base_to_lidar_initialized_) {
+            try {
+                auto tf_stamped = tf_buffer_->lookupTransform(
+                    base_frame_, lidar_frame_, stamp, rclcpp::Duration::from_seconds(0.5));
+                tf2::Transform tf_base_to_lidar;
+                tf2::fromMsg(tf_stamped.transform, tf_base_to_lidar);
+                tf_odom_to_lidar_odom_ = tf_base_to_lidar;
+                tf_base_to_lidar_initialized_ = true;
+            } catch (tf2::TransformException & ex) {
+                RCLCPP_WARN(this->get_logger(), "TF lookup failed: %s Retrying...", ex.what());
+                return;
+            }
+        }
+
+        tf2::Transform tf_lidar_odom_to_lidar;
+        tf2::fromMsg(odomAftMapped.pose.pose, tf_lidar_odom_to_lidar);
+        tf2::Transform tf_odom_to_lidar = tf_odom_to_lidar_odom_ * tf_lidar_odom_to_lidar;
+        tf2::Transform tf_odom_to_base = tf_odom_to_lidar * tf_odom_to_lidar_odom_.inverse();
+
+        nav_msgs::msg::Odometry odom_out;
+        odom_out.header.stamp = stamp;
+        odom_out.header.frame_id = odom_frame_;
+        odom_out.child_frame_id = lidar_frame_;
+        const auto & origin = tf_odom_to_lidar.getOrigin();
+        odom_out.pose.pose.position.x = origin.x();
+        odom_out.pose.pose.position.y = origin.y();
+        odom_out.pose.pose.position.z = origin.z();
+        odom_out.pose.pose.orientation = tf2::toMsg(tf_odom_to_lidar.getRotation());
+        pubLidarOdometry_->publish(odom_out);
+
+        geometry_msgs::msg::TransformStamped tf_msg;
+        tf_msg.header.stamp = stamp;
+        tf_msg.header.frame_id = odom_frame_;
+        tf_msg.child_frame_id = base_frame_;
+        const auto & base_origin = tf_odom_to_base.getOrigin();
+        tf_msg.transform.translation.x = base_origin.x();
+        tf_msg.transform.translation.y = base_origin.y();
+        tf_msg.transform.translation.z = base_origin.z();
+        tf_msg.transform.rotation = tf2::toMsg(tf_odom_to_base.getRotation());
+        tf_broadcaster_->sendTransform(tf_msg);
+    }
+
+    void publish_registered_scan(const sensor_msgs::msg::PointCloud2 & cloud_in, const rclcpp::Time & stamp)
+    {
+        if (!odom_interface_en_ || !tf_base_to_lidar_initialized_) return;
+
+        sensor_msgs::msg::PointCloud2 cloud_out;
+        pcl_ros::transformPointCloud(odom_frame_, tf_odom_to_lidar_odom_, cloud_in, cloud_out);
+        cloud_out.header.stamp = stamp;
+        pubRegisteredScan_->publish(cloud_out);
+    }
+
     void map_publish_callback()
     {
         if (map_pub_en) publish_map(pubLaserCloudMap_);
@@ -1155,6 +1214,8 @@ private:
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubRegisteredScan_;
+    rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubLidarOdometry_;
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl_pc_;
     rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr sub_pcl_livox_;
