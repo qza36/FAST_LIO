@@ -952,7 +952,9 @@ public:
             tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
             tf_listener_ = std::make_unique<tf2_ros::TransformListener>(*tf_buffer_);
             pubRegisteredScan_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/registered_scan", 20);
+            pubSensorScan_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/sensor_scan", 20);
             pubLidarOdometry_ = this->create_publisher<nav_msgs::msg::Odometry>("/lidar_odometry", 20);
+            pubChassisOdometry_ = this->create_publisher<nav_msgs::msg::Odometry>("/odometry", 20);
             RCLCPP_INFO(this->get_logger(), "Odom interface enabled: odom_frame=%s, base_frame=%s, lidar_frame=%s",
                         odom_frame_.c_str(), base_frame_.c_str(), lidar_frame_.c_str());
         }
@@ -1096,6 +1098,7 @@ private:
             if (scan_pub_en)      publish_frame_world(pubLaserCloudFull_);
             if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body_);
             if (effect_pub_en) publish_effect_world(pubLaserCloudEffect_);
+            if (scan_pub_en) publish_sensor_scan(get_ros_time(lidar_end_time));
             // if (map_pub_en) publish_map(pubLaserCloudMap_);
 
             /*** Debug variables ***/
@@ -1174,16 +1177,64 @@ private:
         tf_msg.transform.translation.z = base_origin.z();
         tf_msg.transform.rotation = tf2::toMsg(tf_odom_to_base.getRotation());
         tf_broadcaster_->sendTransform(tf_msg);
+
+        nav_msgs::msg::Odometry chassis_odom;
+        chassis_odom.header.stamp = stamp;
+        chassis_odom.header.frame_id = odom_frame_;
+        chassis_odom.child_frame_id = base_frame_;
+        chassis_odom.pose.pose.position.x = base_origin.x();
+        chassis_odom.pose.pose.position.y = base_origin.y();
+        chassis_odom.pose.pose.position.z = base_origin.z();
+        chassis_odom.pose.pose.orientation = tf2::toMsg(tf_odom_to_base.getRotation());
+
+        auto current_time = std::chrono::steady_clock::now();
+        double dt = std::chrono::duration<double>(current_time - prev_odom_time_).count();
+        if (dt > 0 && prev_odom_initialized_) {
+            auto linear_vel = (tf_odom_to_base.getOrigin() - prev_tf_odom_to_base_.getOrigin()) / dt;
+            tf2::Quaternion q_diff = tf_odom_to_base.getRotation() * prev_tf_odom_to_base_.getRotation().inverse();
+            auto angular_vel = q_diff.getAxis() * q_diff.getAngle() / dt;
+            chassis_odom.twist.twist.linear.x = linear_vel.x();
+            chassis_odom.twist.twist.linear.y = linear_vel.y();
+            chassis_odom.twist.twist.linear.z = linear_vel.z();
+            chassis_odom.twist.twist.angular.x = angular_vel.x();
+            chassis_odom.twist.twist.angular.y = angular_vel.y();
+            chassis_odom.twist.twist.angular.z = angular_vel.z();
+        }
+        prev_tf_odom_to_base_ = tf_odom_to_base;
+        prev_odom_time_ = current_time;
+        prev_odom_initialized_ = true;
+        pubChassisOdometry_->publish(chassis_odom);
     }
 
-    void publish_registered_scan(const sensor_msgs::msg::PointCloud2 & cloud_in, const rclcpp::Time & stamp)
+    void publish_sensor_scan(const rclcpp::Time & stamp)
     {
         if (!odom_interface_en_ || !tf_base_to_lidar_initialized_) return;
 
-        sensor_msgs::msg::PointCloud2 cloud_out;
-        pcl_ros::transformPointCloud(odom_frame_, tf_odom_to_lidar_odom_, cloud_in, cloud_out);
-        cloud_out.header.stamp = stamp;
-        pubRegisteredScan_->publish(cloud_out);
+        PointCloudXYZI::Ptr laserCloudFullRes(dense_pub_en ? feats_undistort : feats_down_body);
+        int size = laserCloudFullRes->points.size();
+        PointCloudXYZI::Ptr laserCloudWorld(new PointCloudXYZI(size, 1));
+        for (int i = 0; i < size; i++) {
+            RGBpointBodyToWorld(&laserCloudFullRes->points[i], &laserCloudWorld->points[i]);
+        }
+
+        sensor_msgs::msg::PointCloud2 cloud_world_msg;
+        pcl::toROSMsg(*laserCloudWorld, cloud_world_msg);
+        cloud_world_msg.header.stamp = stamp;
+        cloud_world_msg.header.frame_id = "camera_init";
+
+        sensor_msgs::msg::PointCloud2 cloud_odom;
+        pcl_ros::transformPointCloud(odom_frame_, tf_odom_to_lidar_odom_, cloud_world_msg, cloud_odom);
+        cloud_odom.header.stamp = stamp;
+        pubRegisteredScan_->publish(cloud_odom);
+
+        tf2::Transform tf_lidar_odom_to_lidar;
+        tf2::fromMsg(odomAftMapped.pose.pose, tf_lidar_odom_to_lidar);
+        tf2::Transform tf_odom_to_lidar = tf_odom_to_lidar_odom_ * tf_lidar_odom_to_lidar;
+
+        sensor_msgs::msg::PointCloud2 cloud_lidar;
+        pcl_ros::transformPointCloud(lidar_frame_, tf_odom_to_lidar.inverse(), cloud_odom, cloud_lidar);
+        cloud_lidar.header.stamp = stamp;
+        pubSensorScan_->publish(cloud_lidar);
     }
 
     void map_publish_callback()
@@ -1215,7 +1266,9 @@ private:
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubRegisteredScan_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubSensorScan_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubLidarOdometry_;
+    rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubChassisOdometry_;
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl_pc_;
     rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr sub_pcl_livox_;
@@ -1239,6 +1292,9 @@ private:
     std::string lidar_frame_;
     bool tf_base_to_lidar_initialized_ = false;
     tf2::Transform tf_odom_to_lidar_odom_;
+    tf2::Transform prev_tf_odom_to_base_;
+    std::chrono::steady_clock::time_point prev_odom_time_;
+    bool prev_odom_initialized_ = false;
 
     FILE *fp;
     ofstream fout_pre, fout_out, fout_dbg;
